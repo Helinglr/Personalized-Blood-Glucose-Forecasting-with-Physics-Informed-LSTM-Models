@@ -1,174 +1,182 @@
 import os
-import random
-import numpy as np
-import tensorflow as tf
-
-# --- SABİTLEME AYARLARI (Reproducibility) ---
-# Bu blok, her çalıştırmada AYNI sonucu almanı sağlar.
-SEED_VALUE = 42
-
-os.environ['PYTHONHASHSEED'] = str(SEED_VALUE)
-random.seed(SEED_VALUE)
-np.random.seed(SEED_VALUE)
-tf.random.set_seed(SEED_VALUE)
-
-# Deneysel özellikleri kapat (Deterministik çalışma için)
-os.environ['TF_DETERMINISTIC_OPS'] = '1'
-os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
-
-# --- DİĞER IMPORTLAR ---
 import pandas as pd
-import glob
+import numpy as np
 import matplotlib.pyplot as plt
+import glob
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_absolute_error
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
-from src.drivers import InsulinDriver, carbsDriver
-from src.time_context import TimeContext
-from src.model import GlucoseModel
-from src.solver import ParameterSolver
+# Modüller
 from src.loaders import OhioLoader
+from src.drivers import InsulinDriver, CarbsDriver
+from src.time_context import TimeContext
+from src.model import PhysicsLSTM
+
 # --- AYARLAR ---
 DATA_FOLDER = 'data/'
-LOOK_BACK = 24
-HORIZON = 6 
-EPOCHS = 50 
-BATCH_SIZE = 4 
+LOOK_BACK = 48          # 4 Saat Geçmiş
+PREDICTION_STEPS = 6    # 30 DAKİKA (6 Adım)
+EPOCHS = 60             
+BATCH_SIZE = 32         
 
-def analyze_patient(file_path):
-    patient_id = os.path.basename(file_path).split('.')[0]
-    print(f"\n{'-'*60}")
-    print(f"HASTA ANALİZİ: {patient_id}")
+def preprocess_df(df, desc="Veri"):
+    rename_map = {'cbg': 'glucose', 'carbInput': 'carbs', 'carb': 'carbs', '5minute_intervals_timestamp': 'timestamp'}
+    df = df.rename(columns=rename_map)
     
-    # 1. VERİ YÜKLEME
-    try:
-        loader = OhioLoader()
-        df = loader.load(file_path)
-    except Exception: return None
-
-    if len(df) < 100: return None
-
-    # 2. TEMİZLİK
-    df['bolus'] = df['bolus'].clip(upper=35) 
-    df['carbs'] = df['carbs'].clip(upper=250)
-
-    try:
-        ins_driver = InsulinDriver()
-        carb_driver = carbsDriver()
-        df = ins_driver.calculate_inventory(df)
-        df = carb_driver.calculate_inventory(df)
-        time_ctx = TimeContext()
-        df = time_ctx.add_context(df)
-        df = df.dropna()
-    except Exception: return None
-
-    # 3. HAZIRLIK
-    features = ['glucose', 'IOB', 'COB', 'sin_time', 'cos_time', 
-                'is_morning', 'is_afternoon', 'is_evening', 'is_night']
+    for c in ['bolus', 'carbs', 'glucose']:
+        if c not in df.columns and c != 'glucose': df[c] = 0.0
     
+    df['bolus'] = df['bolus'].fillna(0)
+    df['carbs'] = df['carbs'].fillna(0)
+    
+    if 'glucose' in df.columns:
+        df['glucose'] = df['glucose'].interpolate(method='linear', limit=6)
+        df = df.dropna(subset=['glucose'])
+        df = df[(df['glucose'] > 30) & (df['glucose'] < 600)]
+    else: return pd.DataFrame() 
+
+    df.index = pd.date_range(start='1/1/2022', periods=len(df), freq='5min')
+    
+    # --- YENİ: EMA (Exponential Moving Average) ---
+    # Gürültüyü azaltılmış, trendi netleştirilmiş glikoz verisi.
+    # Span=12 (1 saatlik ortalama ağırlıklı)
+    df['ema'] = df['glucose'].ewm(span=12, adjust=False).mean()
+    
+    time_ctx = TimeContext()
+    df = time_ctx.add_context(df)
+    ins_driver = InsulinDriver(sampling_interval=5)
+    carb_driver = CarbsDriver(sampling_interval=5)
+    df = ins_driver.calculate_all(df)
+    df = carb_driver.calculate_all(df)
+    
+    warmup = 72
+    if len(df) > warmup: df = df.iloc[warmup:]
+    
+    return df
+
+def train_and_test_patient(patient_id, train_path, test_path):
+    print(f"\n{'='*60}")
+    print(f"🏥 HASTA {patient_id}: HYBRID CNN-LSTM (Gürültü Önleyici)")
+    print(f"{'='*60}")
+    
+    try:
+        raw_train = pd.read_csv(train_path)
+        raw_test = pd.read_csv(test_path)
+        df_train = preprocess_df(raw_train, "Train")
+        df_test = preprocess_df(raw_test, "Test")
+    except Exception as e:
+        print(f"❌ Dosya Hatası: {e}")
+        return
+
+    # Scaling (10 Feature)
+    combined = pd.concat([df_train, df_test], axis=0)
     scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled_data = scaler.fit_transform(df[features].values)
+    
+    # 'ema' eklendi
+    features = ['glucose', 'insulin_rate', 'glucose_rate', 'IOB', 'COB', 'bolus', 'carbs', 'sin_time', 'cos_time', 'ema']
+    
+    for col in features:
+        if col not in combined.columns: combined[col] = 0
+    
+    scaler.fit(combined[features])
+    
+    scaled_train = pd.DataFrame(scaler.transform(df_train[features]), columns=features)
+    scaled_test = pd.DataFrame(scaler.transform(df_test[features]), columns=features)
+    
+    # Model
+    lstm_engine = PhysicsLSTM(look_back=LOOK_BACK, prediction_horizon=PREDICTION_STEPS)
+    
+    X_train, y_train, _ = lstm_engine.prepare_data(scaled_train)
+    X_test, y_test, _ = lstm_engine.prepare_data(scaled_test)
+    
+    if len(X_train) == 0: return
 
-    X, y = [], []
-    for i in range(len(scaled_data) - LOOK_BACK - HORIZON):
-        X.append(scaled_data[i:(i + LOOK_BACK), :])
-        y.append(scaled_data[i + LOOK_BACK + HORIZON, 0])
+    callbacks = [
+        EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True, verbose=1),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, verbose=1)
+    ]
     
-    X, y = np.array(X), np.array(y)
-    
-    # --- DOĞRULAMA İÇİN VERİYİ BÖL (Train / Test) ---
-    # Son %20'lik kısmı modele HİÇ göstermeyeceğiz. Sınav yapacağız.
-    split_idx = int(len(X) * 0.8)
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train, y_test = y[:split_idx], y[split_idx:]
-
-    # 4. EĞİTİM
-    print(f"   > Model Eğitiliyor (Train: {len(X_train)}, Test: {len(X_test)})...")
-    gm = GlucoseModel(n_timesteps=LOOK_BACK)
-    
-    early_stop = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
-    
-    history = gm.model.fit(
+    lstm_engine.model.fit(
         X_train, y_train,
-        epochs=EPOCHS, 
-        batch_size=BATCH_SIZE, 
         validation_data=(X_test, y_test),
-        verbose=1, # İlerlemeyi gör
-        callbacks=[early_stop]
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        shuffle=True, 
+        callbacks=callbacks,
+        verbose=1
     )
+    
+    print(f"\n📊 Grafik Çiziliyor...")
+    pred_scaled = lstm_engine.model.predict(X_test).flatten()
+    
+    # Unscale (10 feature olduğu için fonksiyonu güncelledik)
+    def unscale_glucose(val_array):
+        dummy = np.zeros((len(val_array), 10)) # 10 sütun
+        dummy[:, 0] = val_array # 0. sütun glucose
+        return scaler.inverse_transform(dummy)[:, 0]
 
-    # --- 5. KALİTE KONTROL (SİHİRLİ ADIM) ---
-    print(f"   > Doğrulama Testi Yapılıyor...")
+    inv_pred = unscale_glucose(pred_scaled)
+    inv_actual = unscale_glucose(y_test)
+    inv_input = unscale_glucose(X_test[:, -1, 0])
+
+    plt.figure(figsize=(16, 8))
     
-    # Test verisi üzerinde tahmin yap
-    preds_scaled = gm.model.predict(X_test, verbose=0)
+    steps_show = 144 
+    if len(inv_pred) > steps_show:
+        start_idx = len(inv_pred) - steps_show
+    else:
+        start_idx = 0
+        
+    slice_input = inv_input[start_idx:]
+    slice_actual = inv_actual[start_idx:]
+    slice_pred = inv_pred[start_idx:]
     
-    # Geriye Scale Et (Gerçek mg/dL değerlerine dön)
-    # Scaler'ın sadece ilk sütunu (glucose) ile işlem yapıyoruz
-    dummy_scaler = MinMaxScaler()
-    dummy_scaler.min_, dummy_scaler.scale_ = scaler.min_[0], scaler.scale_[0]
+    t_input = np.arange(len(slice_input))
+    t_target = t_input + PREDICTION_STEPS 
     
-    y_test_real = (y_test * (1/scaler.scale_[0])) + scaler.min_[0]
-    preds_real = (preds_scaled.flatten() * (1/scaler.scale_[0])) + scaler.min_[0]
+    plt.plot(t_input, slice_input, label='Mavi: Geçmiş Şeker', color='#3498db', alpha=0.4, linewidth=2)
+    plt.plot(t_target, slice_actual, label='Siyah: Gerçek (30dk Sonra)', color='black', alpha=0.8, linewidth=2.5)
+    plt.plot(t_target, slice_pred, label='Kırmızı: CNN-LSTM Tahmini', color='#e74c3c', linestyle='--', linewidth=2.5)
     
-    # Hata Puanı (MAE): Ortalama kaç mg/dL sapıtmış?
-    mae_score = mean_absolute_error(y_test_real, preds_real)
-    print(f"   > HATA PUANI (MAE): {mae_score:.2f} mg/dL")
+    hour_ticks = np.arange(0, steps_show + 1, 12)
+    hour_labels = [f"{i}s" for i in range(len(hour_ticks))]
+    plt.xticks(hour_ticks, hour_labels, fontsize=11)
     
-    # --- GRAFİK ÇİZ VE KAYDET ---
-    plt.figure(figsize=(12, 6))
-    plt.plot(y_test_real[:200], label='Gerçek Şeker (CGM)', color='black', alpha=0.7)
-    plt.plot(preds_real[:200], label='Yapay Zeka Tahmini', color='red', linestyle='--')
-    plt.title(f"Hasta {patient_id} - Model Performansı (Hata: {mae_score:.1f} mg/dL)")
-    plt.xlabel("Zaman (5dk adımlar)")
-    plt.ylabel("Glikoz (mg/dL)")
-    plt.legend()
+    plt.axhspan(0, 70, color='red', alpha=0.1, label='Hipo')
+    plt.axhspan(180, 400, color='yellow', alpha=0.1, label='Hiper')
+
+    plt.title(f"HASTA {patient_id}: Hybrid CNN-LSTM Sonucu (Düşük Gürültü)", fontsize=14)
+    plt.xlabel("Zaman (Saat)", fontsize=12)
+    plt.ylabel("Glikoz (mg/dL)", fontsize=12)
+    plt.legend(loc='upper left')
     plt.grid(True, alpha=0.3)
     
-    # Kaydet
-    grafik_adi = f"Grafik_{patient_id}.png"
-    plt.savefig(grafik_adi)
-    print(f"   > Grafik kaydedildi: {grafik_adi}")
-    plt.close()
+    plt.savefig(f"Patient_{patient_id}_Hybrid.png")
+    print(f"✅ Kaydedildi: Patient_{patient_id}_Hybrid.png")
 
-    # Eğer Hata çok yüksekse (>30 mg/dL), parametre hesaplama bile.
-    if mae_score > 35:
-        print("   ⚠️ UYARI: Model hatası çok yüksek. Sonuçlar güvenilir değil.")
-    
-    # 6. PARAMETRE ÇÖZME
-    print(f"   > Parametreler Hesaplanıyor...")
-    solver = ParameterSolver(gm.model, scaler)
-    period_results = solver.extract_parameters_by_period(base_glucose=140)
-    
-    flat_result = {"Hasta_ID": patient_id, "MAE_Hata": round(mae_score, 2)}
-    for period, vals in period_results.items():
-        flat_result[f"IDF_{period}"] = max(0, vals['IDF'])
-        flat_result[f"ICR_{period}"] = max(0, vals['ICR'])
-        
-    return flat_result
-
-if __name__ == "__main__":
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-        except RuntimeError: pass
+def main():
+    if not os.path.exists(DATA_FOLDER):
+        print("❌ Klasör yok.")
+        return
 
     all_files = glob.glob(os.path.join(DATA_FOLDER, "*.csv"))
-    full_report = []
-    
-    # Sadece şüpheli hastalara bakalım
-    TARGET_IDS = ["544", "567"]
-    
+    patient_ids = set()
     for f in all_files:
-        if "training" in f and any(tid in f for tid in TARGET_IDS):
-            res = analyze_patient(f)
-            if res:
-                full_report.append(res)
+        filename = os.path.basename(f)
+        pid = filename.split('-')[0].split('_')[0]
+        patient_ids.add(pid)
+    
+    print(f"🔎 Hastalar: {patient_ids}")
+    
+    for pid in patient_ids:
+        train_file = None
+        test_file = None
+        for f in all_files:
+            if pid in f and "training" in f.lower(): train_file = f
+            if pid in f and "test" in f.lower(): test_file = f
+            
+        if train_file and test_file:
+            train_and_test_patient(pid, train_file, test_file)
 
-    if full_report:
-        final_df = pd.DataFrame(full_report)
-        print("\n" + "="*50)
-        print(final_df)
-        final_df.to_csv("Analiz_Grafikli_Sonuc.csv", index=False)
+if __name__ == "__main__":
+    main()
