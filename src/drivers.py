@@ -40,7 +40,7 @@ class CarbsDriver:
         slow_rate = np.convolve(vals, slow_curve, mode='full')[:len(df)]
         
         # 40% slow-wave modulation blending during the evening period
-        is_evening = df['slot'].apply(lambda x: 1.0 if "Akşam" in str(x) else 0.0)
+        is_evening = df['slot'].apply(lambda x: 1.0 if "Evening" in str(x) else 0.0)
         rate = (1.0 - 0.4 * is_evening) * fast_rate + (0.4 * is_evening) * slow_rate
         
         df['carb_absorption'] = rate
