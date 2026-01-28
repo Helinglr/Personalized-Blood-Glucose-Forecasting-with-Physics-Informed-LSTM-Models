@@ -14,7 +14,7 @@ class TimeContext:
         hours = dates.hour
         minutes = dates.minute + hours * 60
         
-        # Fizyolojik Slot Tanımları
+        # Physiological slot definitions
         def get_slot(h):
             if 6 <= h < 11: return "Morning (06-11)"
             elif 11 <= h < 16: return "Afternoon (11-16)"
@@ -23,7 +23,7 @@ class TimeContext:
 
         df['slot'] = [get_slot(h) for h in hours]
         
-        # AI pasif olsa da döngüsel zaman özellikleri veri setinde kalsın
+        #Even if the AI is inactive, cyclical time features should remain in the dataset.
         df['sin_time'] = np.sin(2 * np.pi * minutes / 1440)
         df['cos_time'] = np.cos(2 * np.pi * minutes / 1440)
         return df
