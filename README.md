@@ -21,15 +21,5 @@ Visualization: Matplotlib (Clinical Dashboard)
 📊 Evaluation Metric
 The model is evaluated using the Mean Absolute Relative Difference (MARD), the gold standard in clinical diabetes research
 
-📂├── data/               # Raw patient CSV files (ID-train.csv, ID-test.csv)
-├── src/
-│   ├── loader.py       # Data loading, cleaning, and synchronization
-│   ├── solver.py       # Metabolic coefficient calculator (ISF/ICR)
-│   ├── model.py        # Physics-Informed LSTM architecture
-│   ├── drivers.py      # Kinetic simulators for Insulin and Carbohydrates
-│   └── time_context.py # Circadian rhythm and slot encoding
-├── main.py             # Orchestrator for training and clinical reporting
-└── validator.py        # Empirical validation tool for clinical parameters
-
 
 ⚠️ DisclaimerThis software is developed for research and educational purposes only. It is NOT a medical device. Clinical decisions should never be based solely on these predictions.
