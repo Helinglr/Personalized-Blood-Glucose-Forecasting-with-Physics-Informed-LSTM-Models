@@ -1,87 +1,66 @@
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Input, BatchNormalization, Concatenate, Flatten, Conv1D, MaxPooling1D
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Input, BatchNormalization, Concatenate, Flatten, Conv1D, Embedding
 import tensorflow.keras.backend as K
 
 class PhysicsLSTM:
-    def __init__(self, look_back=48, prediction_horizon=6): # 30 dk
+    def __init__(self, look_back=48, prediction_horizon=18):
         self.look_back = look_back
         self.prediction_horizon = prediction_horizon
+        self.quantiles = [0.1, 0.5, 0.9]
+        self.feature_cols = [
+            'insulin_rate', 'glucose_rate', 'IOB', 'COB', 'bolus', 'carbs', 
+            'sin_time', 'cos_time', 'ema_fast', 'ema_slow', 'ema_diff', 
+            'carb_absorption', 'ISF', 'ICR', 'dyn_ICR_factor', 'adapt_ISF_factor'
+        ]
         self.model = self._build_model()
 
-    def _hybrid_loss(self, y_true, y_pred):
-        """
-        HUBER + ANTI-LAG KAYIP FONKSİYONU
-        Huber Loss: Gürültüye (outliers) karşı dirençlidir.
-        """
-        # 1. Huber Loss (Standart Hata yerine bunu kullanıyoruz)
-        # Hata küçükse karesini, büyükse mutlak değerini alır.
-        # Bu, modelin anlık zıplamalara (gürültüye) aşırı tepki vermesini engeller.
-        huber = tf.keras.losses.Huber(delta=0.05)(y_true, y_pred)
-        
-        # 2. Tembellik Cezası (Anti-Lag)
-        # Modelin "kopyala-yapıştır" yapmasını engellemek için.
-        # (Yöntem olarak basit bir fark cezası kullanıyoruz)
-        diff = y_true - y_pred
-        
-        # Gerçek artarken model düşüyorsa (veya tam tersi) ekstra ceza
-        # Bunu basitçe "Büyük Hata Cezası" olarak ekleyebiliriz
-        large_error_penalty = K.maximum(K.abs(diff) - 0.05, 0.0) * 10.0
-        
-        return huber + large_error_penalty
+    def _quantile_loss(self, y_true, y_pred):
+        losses = []
+        alpha = 0.05
+        for i, q in enumerate(self.quantiles):
+            pred_q = y_pred[:, i::len(self.quantiles)]
+            error = y_true - pred_q
+            q_loss = K.maximum(q * error, (q - 1) * error)
+            for h in range(self.prediction_horizon):
+                weight = 1.0 + (alpha * h)
+                losses.append(K.mean(q_loss[:, h]) * weight)
+        return K.sum(losses)
 
     def _build_model(self):
-        # Girdi: [Look_Back, 10] (Feature sayısı 1 artarak 10 oldu: EMA eklendi)
-        input_layer = Input(shape=(self.look_back, 10))
+        phys_input = Input(shape=(self.look_back, len(self.feature_cols)), name="phys_input")
+        slot_input = Input(shape=(1,), name="slot_input")
         
-        # --- 1. CNN BLOKU (Gürültü Temizleyici) ---
-        # 1D Konvolüsyon: Verideki anlık titreşimleri süzer, trendi çıkarır.
-        x_cnn = Conv1D(filters=64, kernel_size=3, activation='relu', padding='same')(input_layer)
-        x_cnn = BatchNormalization()(x_cnn)
-        # MaxPooling kullanmıyoruz çünkü zaman serisinin uzunluğunu korumak istiyoruz
+        slot_emb = Embedding(4, 8)(slot_input)
+        slot_emb = Flatten()(slot_emb)
         
-        # --- 2. LSTM BLOKU (Zaman Öğrenici) ---
-        x_lstm = LSTM(128, return_sequences=True)(x_cnn) # CNN çıktısını alır
-        x_lstm = Dropout(0.3)(x_lstm)
-        x_lstm = BatchNormalization()(x_lstm)
+        x = Conv1D(32, 5, activation='relu', padding='same')(phys_input)
+        x = BatchNormalization()(x)
+        x = LSTM(64, return_sequences=False)(x)
+        x = Dropout(0.2)(x)
         
-        x_lstm = LSTM(64, return_sequences=False)(x_lstm)
-        x_lstm = Dropout(0.3)(x_lstm)
-        x_lstm = BatchNormalization()(x_lstm)
-        
-        # --- 3. WIDE BLOKU (Anlık Tepki) ---
-        # Son anlık durumu direkt çıkışa bağla (Lag önlemek için)
-        x_wide = Flatten()(input_layer)
-        x_wide = Dense(32, activation='relu')(x_wide)
-        
-        # BİRLEŞTİRME
-        combined = Concatenate()([x_lstm, x_wide])
+        combined = Concatenate()([x, slot_emb])
         x = Dense(64, activation='relu')(combined)
+        output_layer = Dense(self.prediction_horizon * 3, activation='linear')(x)
         
-        # ÇIKIŞ
-        output_layer = Dense(1, activation='linear')(x)
-        
-        model = Model(inputs=input_layer, outputs=output_layer)
-        
-        # Adam Optimizer (Hafifçe yavaşlatılmış öğrenme hızı)
-        opt = tf.keras.optimizers.Adam(learning_rate=0.0005)
-        model.compile(optimizer=opt, loss=self._hybrid_loss)
+        model = Model(inputs=[phys_input, slot_input], outputs=output_layer)
+        model.compile(optimizer=tf.keras.optimizers.Adam(0.001), loss=self._quantile_loss)
         return model
 
-    def prepare_data(self, scaled_df):
-        # ARTIK 10 FEATURE VAR (EMA Eklendi)
-        cols = ['glucose', 'insulin_rate', 'glucose_rate', 'IOB', 'COB', 'bolus', 'carbs', 'sin_time', 'cos_time', 'ema']
+    def prepare_data(self, df):
+        data_input = df[self.feature_cols].values
+        glucose_values = df['glucose'].values
+        slot_map = {"Morning (06-11)": 0, "Afternoon (11-16)": 1, "Evening (16-23)": 2, "Night (23-06)": 3}
         
-        data_input = scaled_df[cols].values
-        data_target = scaled_df['glucose'].values 
-        
-        X, y = [], []
-        limit = len(data_input) - self.look_back - self.prediction_horizon
-        
+        X_phys, X_slot, y_traj, weights = [], [], [], []
+        limit = len(df) - self.look_back - self.prediction_horizon
         for i in range(limit):
-            X.append(data_input[i : (i + self.look_back), :])
-            future_idx = i + self.look_back - 1 + self.prediction_horizon
-            y.append(data_target[future_idx])
+            X_phys.append(data_input[i : (i + self.look_back)])
+            X_slot.append(slot_map.get(df['slot'].iloc[i + self.look_back - 1], 0))
+            g_now = glucose_values[i + self.look_back - 1]
+            y_traj.append([glucose_values[i + self.look_back + h] - g_now for h in range(self.prediction_horizon)])
+            # Confidence-Weighted Learning Weight
+            weights.append(df['Conf'].iloc[i + self.look_back - 1])
             
-        return np.array(X), np.array(y), None
+        return [np.array(X_phys), np.array(X_slot)], np.array(y_traj), np.array(weights)
